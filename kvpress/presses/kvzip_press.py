@@ -4,13 +4,14 @@
 import logging
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MethodType
-from typing import Generator, List
+from typing import Generator, List, cast
 
 import torch
 from torch import nn
 from transformers import AutoTokenizer, Gemma3PreTrainedModel, PreTrainedModel, PreTrainedTokenizer, QuantizedCache
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.models.llama.modeling_llama import rotate_half
 
 from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
@@ -51,6 +52,7 @@ class KVzipPress(BasePress):
     layerwise: bool = False
     n_sink: int = 4
     kvzip_plus_normalization: bool = False
+    _tokenizer: PreTrainedTokenizerBase | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         assert 0 <= self.compression_ratio < 1, "Compression ratio must be between 0 and 1"
@@ -90,8 +92,10 @@ class KVzipPress(BasePress):
         if isinstance(model, Gemma3PreTrainedModel):
             raise ValueError("KVzipPress is not supported for Gemma3ForCausalLM")
 
-        # Store model reference for later use
-        tokenizer = AutoTokenizer.from_pretrained(model.config.name_or_path)
+        # Cache tokenizer to avoid reloading every call
+        if not hasattr(self, "_tokenizer") or self._tokenizer is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(model.config.name_or_path)
+        tokenizer = cast(PreTrainedTokenizerBase, self._tokenizer)
 
         # Get suffix_ids directly using tokenizer's chat template (do this once, not in hook)
         if tokenizer.chat_template is None:
@@ -218,6 +222,25 @@ class KVzipPress(BasePress):
 
         return chunked_input_ids
 
+    def _init_score_val(self, model: PreTrainedModel):
+        """
+        Initialize `self.score_val` for KVzip-style scoring.
+
+        Note: this assumes `self.context_length` is already set and we only support batch size 1,
+        consistent with the existing KVzip implementation.
+        """
+        self.score_val = torch.zeros(
+            (
+                model.config.num_hidden_layers,
+                1,
+                model.config.num_key_value_heads,
+                self.context_length,
+            ),
+            dtype=model.dtype,
+            device=model.device,
+        )
+        self.score_val[..., : self.n_sink] = 1.0
+
     def prepare(
         self,
         model: PreTrainedModel,
@@ -231,17 +254,7 @@ class KVzipPress(BasePress):
         ctx_ids = self._context_ids[:, self.prefix_length :].to("cpu")
 
         # initialize score values
-        self.score_val = torch.zeros(
-            (
-                model.config.num_hidden_layers,
-                1,
-                model.config.num_key_value_heads,
-                self.context_length,
-            ),  # only support batch size of 1
-            dtype=model.dtype,
-            device=model.device,
-        )
-        self.score_val[..., : self.n_sink] = 1.0
+        self._init_score_val(model)
 
         chunked_context_pairs = []
         chunked_input_ids = self._chunk_fn(ctx_ids, chunk_size)
